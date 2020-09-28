@@ -1,0 +1,5 @@
+BMX ファイルの定義にしたがって，レーンごとにパラアウトを出力するツール
+現在の状況としては，ファイルごとに始点を設定して mix 後 1つのファイルに吐き出す処理を行うクラス ArrangedMixingAudioInutStream.scala の作成が終わったところ
+
+ArrangedMixingAudioInputStream.scala は， こちらの実装を参考にした
+https://github.com/leif81/jsresources-examples/blob/master/src/main/java/org/jsresources/audioconcat/MixingFloatAudioInputStream.java
