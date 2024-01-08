@@ -2,24 +2,31 @@ package audioinputstreams
 
 import scala.collection.mutable.Queue
 import scala.collection.mutable.Set
-
-/*
- *	ArrangedMixingAudioInputStream
- */
-
+import dao.AudioFileHandler
 import java.io._
 import javax.sound.sampled._
 
 import org.tritonus.share.sampled.FloatSampleBuffer
 
-class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInputStreams: Seq[(Long, Seq[AudioInputStream])])
+/**
+ * javax.sound.sampled.AudioInputStream を継承した自作クラス
+ * 複数の audio stream (ここでは AudioFileHandler を利用) を配置して混ぜ合わせる
+ * @param audioFormat
+ * @param arrangedAudioInputStreams Frame 単位で AudioFileHandler の開始位置を設定
+ * @param attenuationPerStream
+ */
+class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInputStreams: Seq[(Long, AudioFileHandler)],
+                                     // Attenuate the stream by how many dB per mixed stream
+                                     private val attenuationPerStream: Float = 0.1f)
   extends AudioInputStream(new ByteArrayInputStream(new Array[Byte](0)), audioFormat, AudioSystem.NOT_SPECIFIED) {
+
+  private var framePos2: Long = 0L
 
   // audio input stream now being used
   private val audioInputStreamSet: Set[AudioInputStream] = Set()
 
   // audiostreams that have not been used yet
-  private val audioStreamQueue: Queue[(Long, Seq[AudioInputStream])] = Queue(arrangedAudioInputStreams: _*).sortBy(_._1)
+  private val audioStreamQueue: Queue[(Long, AudioFileHandler)] = Queue(arrangedAudioInputStreams: _*).sortBy(_._1)
 
   // set up the static mix buffer with initially no samples.
   private val mixBuffer = new FloatSampleBuffer(audioFormat.getChannels, 0, audioFormat.getSampleRate)
@@ -27,11 +34,8 @@ class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInpu
   // used for reading samples from the underlying streams.
   private val readBuffer = new FloatSampleBuffer
 
-  // Attenuate the stream by how many dB per mixed stream.
-  private val attenuationPerStream: Float = 0.1f
-
   // The linear factor to apply to all samples
-  private val attenuationFactor = ArrangedMixingAudioInputStream.decibel2linear(-1.0f * attenuationPerStream * arrangedAudioInputStreams.map(_._2.length).max)
+  private val attenuationFactor = ArrangedMixingAudioInputStream.decibel2linear(-1.0f * attenuationPerStream)
 
   private var tempBuffer: Array[Byte] = null
 
@@ -40,21 +44,19 @@ class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInpu
     * If at least one of the input streams has length <code>AudioInputStream.NOT_SPECIFIED</code>, this value is returned.
     */
   override def getFrameLength: Long = {
-    arrangedAudioInputStreams.foldLeft(0L) { (maxFrameLength, streams) =>
-      val inStreamMax = streams._2.foldLeft(0L) { (max, stream) =>
-        // それぞれの位置ごとの最大
-        val lLength = stream.getFrameLength
-        if (lLength == AudioSystem.NOT_SPECIFIED || max == AudioSystem.NOT_SPECIFIED)
-          AudioSystem.NOT_SPECIFIED
-        else
-          Math.max(max, lLength) + streams._1
-      }
-      // 全体の最大と比較
-      if (inStreamMax == AudioSystem.NOT_SPECIFIED || maxFrameLength == AudioSystem.NOT_SPECIFIED)
-        AudioSystem.NOT_SPECIFIED
+    arrangedAudioInputStreams.foldLeft(0L, Map(): Map[String, Long]) { (maxFrameLengthAndCache, framePos2Andhandler) =>
+      val maxFrameLength = maxFrameLengthAndCache._1
+      val lengthCache = maxFrameLengthAndCache._2
+      val audioFramePos = framePos2Andhandler._1
+      val handler = framePos2Andhandler._2
+      // 各audio の最大
+      val lLength = lengthCache.getOrElse(handler.audioFilePath, handler.getFrameLength)
+      val newCache = lengthCache + (handler.audioFilePath -> lLength)
+      if (lLength == AudioSystem.NOT_SPECIFIED || maxFrameLength == AudioSystem.NOT_SPECIFIED)
+        (AudioSystem.NOT_SPECIFIED, newCache)
       else
-        Math.max(maxFrameLength, inStreamMax)
-    }
+        (Math.max(maxFrameLength, lLength + audioFramePos), newCache)
+    }._1
   }
 
   @throws[IOException]
@@ -70,46 +72,51 @@ class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInpu
     */
   @throws[IOException]
   override def read(abData: Array[Byte], nOffset: Int, nLength: Int): Int = {
+
+    val nFrameLength = nLength / getFormat.getFrameSize
+
     // set up the mix buffer with the requested size
-    mixBuffer.changeSampleCount(nLength / getFormat.getFrameSize, false)
+    mixBuffer.changeSampleCount(nFrameLength, false)
     // initialize the mixBuffer with silence
     mixBuffer.makeSilence()
 
     if (audioStreamQueue.nonEmpty) {
-      val (headFramePos, headAudioInputStreamList) = audioStreamQueue.head
+      val (headFramePos, headAudioInputStream) = audioStreamQueue.head
       val nextFrame = nLength / getFormat.getFrameSize
-      if (headFramePos < framePos) {
+      if (headFramePos < framePos2) {
         println("Invalid frame position!")
         throw new IOException
-      } else if (headFramePos == framePos) {
+      } else if (headFramePos == framePos2) {
         // 頭にある場合はそれを audioInputStreamSet に入れる
         audioStreamQueue.dequeue()
-        headAudioInputStreamList.foreach(x => {
-          audioInputStreamSet.add(x)
-        })
+        audioInputStreamSet.add(headAudioInputStream.getAudioInputStream)
         return read(abData, nOffset, nLength)
-      } else if (headFramePos > framePos && headFramePos < framePos + nextFrame) {
-        // 次の framePos の start 地点で分割
-        val nowFramePos = framePos
-        val secondHeadFramePos = ((headFramePos - nowFramePos) * getFormat.getFrameSize).toInt
-        val secondNLength = ((nowFramePos + nextFrame - headFramePos) * getFormat.getFrameSize).toInt
-        val a = read(abData, nOffset, secondHeadFramePos)
-        val b = read(abData, nOffset + secondHeadFramePos, secondNLength)
+      } else if (headFramePos < framePos2 + nextFrame) {
+        // 次の framePos2 の start 地点で分割
+        val nowFramePos = framePos2
+        val firstByteLen = ((headFramePos - nowFramePos) * getFormat.getFrameSize).toInt
+        val secondNLength = nLength - firstByteLen
+        val a = read(abData, nOffset, firstByteLen)
+        val b = read(abData, nOffset + firstByteLen, secondNLength)
         return if (b == -1) -1 else a + b
       }
     }
     // the calculation below is not scala-like so later would like to be refactored
     // remember the maximum number of samples actually mixed
-    val maxMixed = audioInputStreamSet.foldLeft(0) { (max, stream) =>
+    var maxMixed = 0
+    var sampleCount = 0
+    audioInputStreamSet.foreach(stream => {
       val needRead = mixBuffer.getSampleCount * stream.getFormat.getFrameSize
-      if (tempBuffer == null || tempBuffer.length < needRead) tempBuffer = new Array[Byte](needRead)
+      if (tempBuffer == null || tempBuffer.length < needRead) tempBuffer = Array.fill[Byte](needRead)(0)
       val bytesRead = stream.read(tempBuffer, 0, needRead)
       if (bytesRead == -1) {
         audioInputStreamSet.remove(stream)
-        max
+        stream.close()
       } else {
         // now convert this buffer to float samples
         readBuffer.initFromByteArray(tempBuffer, 0, bytesRead, stream.getFormat)
+        sampleCount = readBuffer.getSampleCount
+        maxMixed = Math.max(sampleCount, maxMixed)
         val maxChannels = Math.min(mixBuffer.getChannelCount, readBuffer.getChannelCount)
         (0 until maxChannels).foreach { channel =>
           // get the arrays of the normalized float samples
@@ -120,40 +127,40 @@ class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInpu
             mixSamples(sample) += attenuationFactor * readSamples(sample)
           }
         }
-        if (max < readBuffer.getSampleCount) readBuffer.getSampleCount else max
       }
-    }
-    framePos += nLength / getFormat.getFrameSize
+    })
     if (maxMixed == 0) {
       if (audioInputStreamSet.isEmpty && audioStreamQueue.isEmpty) {
         // nothing mixed, no more streams available: end of stream
         return -1
       }
-      // nothing written, but still streams to read from
+      // 空白を挿入
+      mixBuffer.convertToByteArray(0, mixBuffer.getSampleCount, abData, nOffset, getFormat)
+      framePos2 += nLength / getFormat.getFrameSize
       return nLength
     }
     mixBuffer.convertToByteArray(0, maxMixed, abData, nOffset, getFormat)
+    framePos2 += maxMixed
     maxMixed * getFormat.getFrameSize
   }
 
   /**
-    * skips lLengnth from the framePos
+    * skips lLengnth from the framePos2
     */
   @throws[IOException]
   override def skip(lLength: Long): Long = {
     val skippedMax = audioInputStreamSet.map(_.skip(lLength)).max
     val nextFrame = lLength / getFormat.getFrameSize
-    val headFramePosOverLlength = audioStreamQueue.filter(x => x._1 < framePos + nextFrame)
+    val headFramePosOverLlength = audioStreamQueue.filter(x => x._1 < framePos2 + nextFrame)
     val skippedMaxInQueue = headFramePosOverLlength.map(x => {
       audioStreamQueue.dequeue()
-      val (headFramePos, headAudioInputStreamList) = x
-      headAudioInputStreamList.map(y => {
-        audioInputStreamSet.add(y)
-        val skipped = y.skip(lLength - (headFramePos - framePos))
-        skipped + (headFramePos - framePos)
-      }).max
+      val (headFramePos, headAudioInputStream) = x
+      val audioInputStream = headAudioInputStream.getAudioInputStream
+      audioInputStreamSet.add(audioInputStream)
+      val skipped = audioInputStream.skip(lLength - (headFramePos - framePos2))
+      skipped + (headFramePos - framePos2)
     }).max
-    framePos += lLength / getFormat.getFrameSize
+    framePos2 += lLength / getFormat.getFrameSize
     Math.max(skippedMax, skippedMaxInQueue)
   }
 
@@ -162,25 +169,24 @@ class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInpu
     */
   @throws[IOException]
   override def available: Int = {
-    audioStreamQueue.map(_._2.map(_.available()).min).min
+    audioStreamQueue.map(_._2.available()).min
   }
 
   @throws[IOException]
   override def close() {
-    audioStreamQueue.foreach(_._2.map(_.close()))
     audioInputStreamSet.foreach(_.close())
     audioInputStreamSet.foreach(audioInputStreamSet.remove(_))
   }
 
   /**
-    * まだ出来ていない
+    * 実装出来ていない
     */
   override def mark(nReadLimit: Int) {
     // audioInputStreamSet.foreach(_.mark(nReadLimit))
   }
 
   /**
-    * 同上
+    * 実装できていない
     */
   @throws[IOException]
   override def reset() {
@@ -188,7 +194,7 @@ class ArrangedMixingAudioInputStream(audioFormat: AudioFormat, arrangedAudioInpu
   }
 
   /**
-    * 出来ていないので false を返す
+    * 実装出来ていないので false を返す
     * 将来的に実装するかは未定
     */
   override def markSupported: Boolean = {

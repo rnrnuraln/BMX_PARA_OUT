@@ -1,4 +1,6 @@
 .idea/
 project/
 target/
-src/main/java/org/jsresources/
+.bsp/
+.DS_Store
+*.jar
